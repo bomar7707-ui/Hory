@@ -33,7 +33,7 @@
                     </div>
                     <div>
                         <h1 class="font-bold text-lg tracking-tight">Archív Prošlých Tras</h1>
-                        <p class="text-xs text-emerald-100">Synchronizováno s Horským zápisníkem</p>
+                        <p class="text-xs text-emerald-100">Synchronizováno s Horským zápisníkem (vč. GPX v cloudu)</p>
                     </div>
                 </div>
                 <button onclick="window.toggleSidebarMobile()" class="md:hidden text-white/80 hover:text-white p-2">
@@ -165,7 +165,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, initializeFirestore, collection, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, initializeFirestore, collection, getDocs, doc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const apiKey = "3SfstVBaZryBHeEkOsw_DSAc8PwcV140TQvNslWDrQY";
 
@@ -182,7 +182,6 @@
         try {
             app = initializeApp(firebaseConfig);
             auth = getAuth(app);
-            // LongPolling ensures mobile networks / restrictive browsers can connect smoothly
             try {
                 db = initializeFirestore(app, { experimentalForceLongPolling: true });
             } catch(e) {
@@ -289,9 +288,11 @@
                         
                         const updatedMaps = cleanUrls.map((url) => {
                             const oldMap = existingTrip.maps ? existingTrip.maps.find(m => m.url === url) : null;
+                            const cloudMap = data.gpxMapData && data.gpxMapData[url] ? data.gpxMapData[url] : null;
+                            
                             return {
                                 url: url,
-                                coordinates: oldMap ? oldMap.coordinates : [],
+                                coordinates: (cloudMap && cloudMap.coordinates && cloudMap.coordinates.length > 0) ? cloudMap.coordinates : (oldMap ? oldMap.coordinates : []),
                                 visible: oldMap ? oldMap.visible : true
                             };
                         });
@@ -304,11 +305,14 @@
                         window.archivedTrips[existingIndex].maps = updatedMaps;
                         updatedCount++;
                     } else {
-                        const mapsArr = cleanUrls.map(url => ({
-                            url: url,
-                            coordinates: [],
-                            visible: true
-                        }));
+                        const mapsArr = cleanUrls.map(url => {
+                            const cloudMap = data.gpxMapData && data.gpxMapData[url] ? data.gpxMapData[url] : null;
+                            return {
+                                url: url,
+                                coordinates: cloudMap && cloudMap.coordinates ? cloudMap.coordinates : [],
+                                visible: true
+                            };
+                        });
 
                         window.archivedTrips.push({
                             id: tripId,
@@ -335,7 +339,7 @@
                 if (window.archivedTrips.length > 0) {
                     window.showToast('Byla načtena uložená lokální data z paměti.', 'success');
                 } else {
-                    window.showToast('Připojení k Firebase z mobilní sítě selhalo. Použijte Záloha IN.', 'warning');
+                    window.showToast('Připojení k Firebase selhalo. Zkontrolujte připojení.', 'warning');
                 }
             } finally {
                 btn.innerHTML = originalBtnHtml;
@@ -348,12 +352,12 @@
             document.getElementById('attach-gpx-input').click();
         };
 
-        window.handleAttachGPX = function(event) {
+        window.handleAttachGPX = async function(event) {
             const file = event.target.files[0];
             if (!file || window.currentAttachTripId === null || window.currentAttachMapIndex === null) return;
 
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 try {
                     const parser = new DOMParser();
                     const xmlDoc = parser.parseFromString(e.target.result, "text/xml");
@@ -366,12 +370,32 @@
                     if (coords.length > 0) {
                         const tripIndex = window.archivedTrips.findIndex(t => t.id === window.currentAttachTripId);
                         if (tripIndex !== -1 && window.archivedTrips[tripIndex].maps[window.currentAttachMapIndex]) {
-                            window.archivedTrips[tripIndex].maps[window.currentAttachMapIndex].coordinates = coords;
-                            window.archivedTrips[tripIndex].maps[window.currentAttachMapIndex].visible = true; 
+                            const trip = window.archivedTrips[tripIndex];
+                            trip.maps[window.currentAttachMapIndex].coordinates = coords;
+                            trip.maps[window.currentAttachMapIndex].visible = true;
+                            
                             window.saveToStorage();
                             window.renderMap();
                             window.renderSidebar();
-                            window.showToast('GPX pro tuto část trasy bylo spárováno!');
+
+                            // Automatically save GPX coordinates to Firebase cloud so mobile devices get them too!
+                            if (db) {
+                                try {
+                                    const gpxMapDataObj = {};
+                                    trip.maps.forEach(m => {
+                                        if (m.url) {
+                                            gpxMapDataObj[m.url] = { coordinates: m.coordinates };
+                                        }
+                                    });
+                                    await setDoc(doc(db, 'vyslapy', trip.id), { gpxMapData: gpxMapDataObj }, { merge: true });
+                                    window.showToast('GPX uloženo lokálně i do cloudu pro všechna zařízení!');
+                                } catch (cloudErr) {
+                                    console.warn("Cloud sync warning:", cloudErr);
+                                    window.showToast('GPX spárováno v zařízení!');
+                                }
+                            } else {
+                                window.showToast('GPX spárováno v zařízení!');
+                            }
                         }
                     } else {
                         window.showToast('GPX soubor neobsahuje žádné body trasy', 'warning');
@@ -710,9 +734,9 @@
             `}).join('');
         };
 
-        window.saveToStorage = () => localStorage.setItem('hikingArchiveDataFirebase', JSON.stringify(window.archivedTrips));
+        window.saveToStorage = () => localStorage.setItem('hikingArchiveDataFirebaseV2', JSON.stringify(window.archivedTrips));
         window.loadFromStorage = () => {
-            const stored = localStorage.getItem('hikingArchiveDataFirebase');
+            const stored = localStorage.getItem('hikingArchiveDataFirebaseV2');
             if (stored) {
                 try {
                     window.archivedTrips = JSON.parse(stored);
